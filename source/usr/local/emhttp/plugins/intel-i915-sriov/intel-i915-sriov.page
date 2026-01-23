@@ -1,4 +1,5 @@
 Menu="Utilities"
+Cond="version_compare(parse_ini_file('/etc/unraid-version')['version'],'7.3', '<')"
 Title="Intel Graphics SR-IOV"
 Icon="intel-i915-sriov.png"
 ---
