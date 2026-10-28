@@ -1,0 +1,246 @@
+name: Prepare Unraid SR-IOV Plugin Update (review branch)
+
+on:
+  workflow_dispatch:
+    inputs:
+      plugin_version:
+        description: 'Plugin UI version (YYYY.MM.DD, optionally .N)'
+        type: string
+        required: true
+        default: '2026.10.28'
+
+# Can push only to this repository. The workflow does not publish releases,
+# edit master, or install anything to an Unraid host.
+permissions:
+  contents: write
+
+jobs:
+  package-plugin-ui:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PLUGIN_VERSION: ${{ inputs.plugin_version }}
+    steps:
+      - name: Checkout fork master
+        uses: actions/checkout@v5
+        with:
+          ref: master
+          persist-credentials: true
+
+      - name: Build matching UI TXZ and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$PLUGIN_VERSION" =~ ^20[0-9]{2}\.[0-9]{1,2}\.[0-9]{1,2}(\.[0-9]+)?$ ]]; then
+            echo '::error::Version must look like 2026.10.28 or 2026.10.28.1'
+            exit 1
+          fi
+          PACKAGE="unraid-i915-sriov-${PLUGIN_VERSION}.txz"
+          test -d source/usr/local/emhttp/plugins/intel-i915-sriov
+          if test -e "packages/$PACKAGE"; then
+            echo "::error::Refusing to replace existing $PACKAGE"
+            exit 1
+          fi
+
+          STAGE="$RUNNER_TEMP/plugin-ui"
+          mkdir -p "$STAGE/usr/local/emhttp/plugins" "$STAGE/install" packages
+          cp -a source/usr/local/emhttp/plugins/intel-i915-sriov \
+                "$STAGE/usr/local/emhttp/plugins/"
+          chmod -R u=rwX,go=rX "$STAGE/usr"
+          chmod 755 "$STAGE/usr/local/emhttp/plugins/intel-i915-sriov/include/tools.sh"
+
+          cat > "$STAGE/install/slack-desc" <<'SLACKDESC'
+          intel-i915-sriov: Intel iGPU SR-IOV management UI for Unraid
+          intel-i915-sriov:
+          intel-i915-sriov: This package contains only the plugin settings page.
+          intel-i915-sriov: The kernel driver is a separate release-specific TXZ.
+          intel-i915-sriov:
+          intel-i915-sriov: Fork maintained by airlychee.
+          intel-i915-sriov:
+          intel-i915-sriov:
+          intel-i915-sriov:
+          intel-i915-sriov:
+          intel-i915-sriov:
+          SLACKDESC
+
+          (cd "$STAGE" && tar --sort=name --mtime=@0 --owner=0 --group=0 \
+             --numeric-owner -cJf "$GITHUB_WORKSPACE/packages/$PACKAGE" ./install ./usr)
+          (
+            cd packages
+            md5sum "$PACKAGE" > "$PACKAGE.md5"
+            sha256sum "$PACKAGE" > "$PACKAGE.sha256"
+            md5sum -c "$PACKAGE.md5"
+            sha256sum -c "$PACKAGE.sha256"
+          )
+          tar -tJf "packages/$PACKAGE" > "$RUNNER_TEMP/plugin-ui-contents.txt"
+          grep -Fqx './usr/local/emhttp/plugins/intel-i915-sriov/intel-i915-sriov.page' \
+            "$RUNNER_TEMP/plugin-ui-contents.txt"
+          grep -Fqx './usr/local/emhttp/plugins/intel-i915-sriov/include/tools.sh' \
+            "$RUNNER_TEMP/plugin-ui-contents.txt"
+          echo 'UI package created without kernel modules.'
+
+      - name: Update manifest version and safer kernel package handling
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, os, re, subprocess, tempfile
+          import xml.etree.ElementTree as ET
+
+          path = Path('i915-sriov.plg')
+          code = path.read_text()
+          ver = os.environ['PLUGIN_VERSION']
+          pkg = Path('packages') / f'unraid-i915-sriov-{ver}.txz'
+          digest = hashlib.md5(pkg.read_bytes()).hexdigest()
+
+          def replace_once(old, new, label):
+              global code
+              count = code.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected 1 match, found {count}')
+              code = code.replace(old, new, 1)
+
+          replace_once('  <!ENTITY author    "airlychee">',
+                       '  <!ENTITY author    "airlychee">', 'fork owner')
+          match = re.search(r'<!ENTITY version\s+"([^"]+)"', code)
+          if not match or match.group(1) == ver:
+              raise SystemExit('Expected a previous distinct plugin version')
+          old_ver = match.group(1)
+          replace_once(f'<!ENTITY version   "{old_ver}"',
+                       f'<!ENTITY version   "{ver}"', 'plugin version')
+          match = re.search(r'<!ENTITY md5\s+"([0-9a-f]{32})"', code)
+          if not match:
+              raise SystemExit('Could not locate previous UI package MD5')
+          replace_once(f'<!ENTITY md5       "{match.group(1)}"',
+                       f'<!ENTITY md5       "{digest}"', 'plugin UI MD5')
+          replace_once('<CHANGES>\n',
+                       f'<CHANGES>\n\n### {ver}\n'
+                       '- Fork-specific UI package and checksum.\n'
+                       '- Resolve and validate the exact kernel package before changing host settings.\n'
+                       '- Fix cached package validation and exact install filename.\n\n',
+                       'changelog')
+
+          start = code.index('#Download i915-sriov module Package')
+          end = code.index('#Create settings file if not found')
+          if start >= end or 'DL_URL=' not in code or 'LAT_PACKAGE=' not in code:
+              raise SystemExit('Unexpected original plugin structure')
+
+          functions = r'''# Download only a publicly published, kernel-matching Release asset.
+          download() {
+            local target="&packages;/${KERNEL_V%%-*}/${LAT_PACKAGE}"
+            local tmp="${target}.tmp.$$"
+            local expected actual
+            rm -f "$tmp" "${tmp}.md5"
+            if ! wget -q -O "$tmp" "${DL_URL}/${LAT_PACKAGE}"; then
+              echo "ERROR: Unable to download SR-IOV driver $LAT_PACKAGE" &gt;&amp;2
+              rm -f "$tmp" "${tmp}.md5"
+              return 1
+            fi
+            if ! wget -q -O "${tmp}.md5" "${DL_URL}/${LAT_PACKAGE}.md5"; then
+              echo "ERROR: Unable to download checksum for $LAT_PACKAGE" &gt;&amp;2
+              rm -f "$tmp" "${tmp}.md5"
+              return 1
+            fi
+            expected="$(awk 'NR==1 {print $1}' "${tmp}.md5")"
+            actual="$(md5sum "$tmp" | awk '{print $1}')"
+            if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+              echo "ERROR: SR-IOV package checksum mismatch" &gt;&amp;2
+              rm -f "$tmp" "${tmp}.md5"
+              return 1
+            fi
+            mv -f "$tmp" "$target"
+            mv -f "${tmp}.md5" "${target}.md5"
+          }
+
+          check() {
+            local result target expected actual
+            if ! result="$(wget -qO- "https://api.github.com/repos/airlychee/unraid-i915-sriov/releases/tags/${KERNEL_V}")"; then
+              echo "ERROR: No publicly accessible SR-IOV Release for $KERNEL_V" &gt;&amp;2
+              return 1
+            fi
+            LAT_PACKAGE="$(printf '%s' "$result" | jq -r '.assets[]?.name' | grep -E '^i915-sriov-.*\.txz$' | sort -V | tail -1)"
+            if [ -z "$LAT_PACKAGE" ]; then
+              echo "ERROR: No SR-IOV TXZ asset for $KERNEL_V" &gt;&amp;2
+              return 1
+            fi
+            target="&packages;/${KERNEL_V%%-*}/${LAT_PACKAGE}"
+            if [ -s "$target" ] &amp;&amp; [ -s "${target}.md5" ]; then
+              expected="$(awk 'NR==1 {print $1}' "${target}.md5")"
+              actual="$(md5sum "$target" | awk '{print $1}')"
+              if [ -n "$expected" ] &amp;&amp; [ "$expected" = "$actual" ]; then
+                echo "Verified cached package: $LAT_PACKAGE"
+                return 0
+              fi
+            fi
+            download
+          }
+
+          install() {
+            /sbin/installpkg "&packages;/${KERNEL_V%%-*}/${LAT_PACKAGE}" || return 1
+            depmod -a
+          }
+
+          enable_module() {
+            modprobe i915 enable_guc=3 max_vfs=7
+          }
+
+          # Must verify availability before blacklisting i915 or modifying VFs.
+          KERNEL_V="$(uname -r)"
+          PACKAGE="i915-sriov"
+          DL_URL="https://github.com/airlychee/unraid-i915-sriov/releases/download/$KERNEL_V"
+          mkdir -p "&packages;/${KERNEL_V%%-*}"
+          check || exit 1
+
+          '''
+          code = code[:start] + functions + code[end:]
+
+          start = code.index('#Define Variables')
+          end = code.index('if ! lsmod | grep -q "^i915"')
+          if start >= end:
+              raise SystemExit('Could not find old install block')
+          install_block = r'''# Install precisely the verified package for this kernel.
+          if [ ! -f "/var/log/packages/${LAT_PACKAGE%.txz}" ]; then
+            echo "Installing SR-IOV driver package: $LAT_PACKAGE"
+            install || exit 1
+          else
+            echo "SR-IOV driver package already installed: $LAT_PACKAGE"
+          fi
+          '''
+          code = code[:start] + install_block + code[end:]
+
+          path.write_text(code)
+          root = ET.parse(path).getroot()
+          assert root.attrib['author'] == 'airlychee'
+          assert root.attrib['version'] == ver
+          for file_node in root.findall('FILE'):
+              if file_node.attrib.get('Run') == '/bin/bash':
+                  inline = file_node.find('INLINE')
+                  if inline is not None and inline.text:
+                      with tempfile.NamedTemporaryFile('w', suffix='.sh') as script:
+                          script.write(inline.text)
+                          script.flush()
+                          subprocess.run(['bash', '-n', script.name], check=True)
+          print(f'Plugin manifest parsed, inline shell syntax valid: {ver}, md5={digest}')
+          PY
+
+      - name: Validate and push proposed changes to review branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          echo 'Changed files:'
+          git status --short
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          BRANCH="plugin-ui-${PLUGIN_VERSION//./-}-${GITHUB_RUN_ID}"
+          git switch -c "$BRANCH"
+          git add i915-sriov.plg \
+            "packages/unraid-i915-sriov-${PLUGIN_VERSION}.txz" \
+            "packages/unraid-i915-sriov-${PLUGIN_VERSION}.txz.md5" \
+            "packages/unraid-i915-sriov-${PLUGIN_VERSION}.txz.sha256"
+          git diff --cached --check
+          git commit -m "Prepare SR-IOV fork plugin UI ${PLUGIN_VERSION}"
+          git push -u origin "$BRANCH"
+          echo "::notice::Review the branch and merge only when ready: https://github.com/${GITHUB_REPOSITORY}/compare/master...${BRANCH}?expand=1"
+          echo 'This workflow did not alter master or publish a Release.'
