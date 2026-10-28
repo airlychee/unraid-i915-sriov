@@ -1,0 +1,40 @@
+
+name: Unraid SR-IOV Kernel Check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-kernel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check build environment
+        run: |
+          uname -a
+          gcc --version | head -n 1
+          df -h .
+
+      - name: Download and verify kernel source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          KERNEL="6.18.58-Unraid"
+          FILE="linux-${KERNEL}.tar.xz"
+
+          curl -fL --retry 3 \
+            -o "$FILE" \
+            "https://github.com/ich777/unraid_kernel/releases/download/${KERNEL}/${FILE}"
+
+          printf '%s  %s\n' \
+            "da2ae45037a7f8049bbc9eeb306cf5385f59216c8c055c6ee827d243b016e962" \
+            "$FILE" | sha256sum -c -
+
+          tar -tJf "$FILE" > /dev/null
+
+          echo "Kernel archive verified successfully."
