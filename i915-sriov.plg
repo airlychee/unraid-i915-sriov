@@ -112,7 +112,7 @@ check() {
 if ! ls -1 &packages;/${KERNEL_V%%-*}/ | grep -q "${PACKAGE}" ; then
   LAT_PACKAGE="$(wget -qO- https://api.github.com/repos/airlychee/unraid-i915-sriov/releases/tags/${KERNEL_V} | jq -r '.assets[]?.name' | grep -E '^i915-sriov-.*\.txz$' | sort -V | tail -1)"
   if [ -z "$LAT_PACKAGE" ]; then
-    echo "ERROR: No published SR-IOV package for $KERNEL_V" >&2
+    echo "ERROR: No published SR-IOV package for $KERNEL_V" >&amp;2
     exit 1
   fi
   echo
