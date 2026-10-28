@@ -1,0 +1,102 @@
+name: Build Intel i915 SR-IOV - Unraid 6.18.58
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      KERNEL_VERSION: 6.18.58-Unraid
+      DRIVER_REF: 2026.03.05.7
+
+    steps:
+      - name: Check out plugin repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install compiler and dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-14 g++-14 make bc bison flex libelf-dev \
+            libssl-dev dwarves kmod xz-utils git perl python3
+          gcc-14 --version | head -1
+          test "$(gcc-14 -dumpfullversion | cut -d. -f1,2)" = "14.2"
+          df -h .
+
+      - name: Download and verify matching Unraid kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE="linux-${KERNEL_VERSION}.tar.xz"
+          curl -fL --retry 3 -o "$RUNNER_TEMP/$ARCHIVE" \
+            "https://github.com/ich777/unraid_kernel/releases/download/${KERNEL_VERSION}/${ARCHIVE}"
+          printf '%s  %s\n' \
+            'da2ae45037a7f8049bbc9eeb306cf5385f59216c8c055c6ee827d243b016e962' \
+            "$RUNNER_TEMP/$ARCHIVE" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/kernel"
+          tar -xJf "$RUNNER_TEMP/$ARCHIVE" -C "$RUNNER_TEMP/kernel"
+          test -s "$RUNNER_TEMP/kernel/.config"
+          test -s "$RUNNER_TEMP/kernel/Module.symvers"
+          grep '^CONFIG_CC_VERSION_TEXT=' "$RUNNER_TEMP/kernel/.config"
+          ACTUAL="$(make --no-print-directory -s -C "$RUNNER_TEMP/kernel" kernelrelease)"
+          test "$ACTUAL" = "$KERNEL_VERSION" || {
+            echo "Kernel release mismatch: $ACTUAL != $KERNEL_VERSION" >&2
+            exit 1
+          }
+
+      - name: Check out compatible SR-IOV driver source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$DRIVER_REF" \
+            https://github.com/strongtz/i915-sriov-dkms.git "$RUNNER_TEMP/i915-sriov-dkms"
+          git -C "$RUNNER_TEMP/i915-sriov-dkms" rev-parse HEAD
+
+      - name: Compile modules for target kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -j2 -C "$RUNNER_TEMP/kernel" \
+            M="$RUNNER_TEMP/i915-sriov-dkms" \
+            CC=gcc-14 HOSTCC=gcc-14 modules
+          test -s "$RUNNER_TEMP/i915-sriov-dkms/drivers/gpu/drm/i915/i915.ko"
+
+      - name: Validate and collect modules (not an installable package)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/modules
+          SOURCE="$RUNNER_TEMP/i915-sriov-dkms"
+          : > out/build-report.txt
+          printf 'Target kernel: %s\nDriver ref: %s\nDriver commit: %s\n' \
+            "$KERNEL_VERSION" "$DRIVER_REF" \
+            "$(git -C "$SOURCE" rev-parse HEAD)" >> out/build-report.txt
+          count=0
+          while IFS= read -r -d '' module; do
+            echo "Checking: $module"
+            modinfo -F vermagic "$module" | tee -a out/build-report.txt
+            modinfo -F vermagic "$module" | grep -Fq "$KERNEL_VERSION "
+            rel="${module#"$SOURCE"/}"
+            install -D -m 0644 "$module" "out/modules/$rel"
+            count=$((count + 1))
+          done < <(find "$SOURCE" -type f -name '*.ko' -print0)
+          test "$count" -gt 0
+          printf 'Compiled modules: %s\n' "$count" | tee -a out/build-report.txt
+          find out/modules -type f -name '*.ko' -print
+          (cd out && sha256sum $(find modules -type f -name '*.ko' | sort) > SHA256SUMS)
+
+      - name: Upload compiled modules for inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: i915-sriov-6.18.58-Unraid-unverified
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
