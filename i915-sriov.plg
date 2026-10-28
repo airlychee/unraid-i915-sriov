@@ -127,7 +127,7 @@ fi
 
 # Installation
 install() {
-  /sbin/installpkg "&packages;/${KERNEL_V%%-*}/${PACKAGE}*.txz"
+  /sbin/installpkg "&packages;/${KERNEL_V%%-*}/"${PACKAGE}*.txz || return 1
   depmod -a
 }
 
