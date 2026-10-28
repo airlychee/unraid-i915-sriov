@@ -2,11 +2,11 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name      "i915-sriov">
   <!ENTITY author    "airlychee">
-  <!ENTITY version   "2023.11.22">
+  <!ENTITY version   "2026.10.28">
   <!ENTITY launch    "Settings/intel-&name;">
   <!ENTITY gitURL    "https://github.com/&author;/unraid-&name;/raw/master">
   <!ENTITY pluginURL "&gitURL;/&name;.plg">
-  <!ENTITY md5       "9516507fa265734a221750d38140756f">
+  <!ENTITY md5       "f8c97fb95dd24b466c4468164ecac611">
   <!ENTITY plugin    "/boot/config/plugins/&name;">
   <!ENTITY emhttp    "/usr/local/emhttp/plugins/intel-&name;">
   <!ENTITY packages  "/boot/config/plugins/&name;/packages">
@@ -22,6 +22,12 @@
 
 
 <CHANGES>
+
+### 2026.10.28
+- Fork-specific UI package and checksum.
+- Resolve and validate the exact kernel package before changing host settings.
+- Fix cached package validation and exact install filename.
+
 
 ### 2024.02.19
 - Forked repository from ich777.
@@ -83,57 +89,71 @@ You can get more details here: https://github.com/strongtz/i915-sriov-dkms
 <FILE Run="/bin/bash">
 <INLINE>
 
-#Download i915-sriov module Package
+# Download only a publicly published, kernel-matching Release asset.
 download() {
-# Download sriov package
-if wget -q -nc --show-progress --progress=bar:force:noscroll -O "&packages;/${KERNEL_V%%-*}/${LAT_PACKAGE}" "${DL_URL}/${LAT_PACKAGE}" ; then
-  wget -q -nc --show-progress --progress=bar:force:noscroll -O "&packages;/${KERNEL_V%%-*}/${LAT_PACKAGE}.md5" "${DL_URL}/${LAT_PACKAGE}.md5"
-  if [ "$(md5sum &packages;/${KERNEL_V%%-*}/${LAT_PACKAGE} | awk '{print $1}')" != "$(cat &packages;/${KERNEL_V%%-*}/${LAT_PACKAGE}.md5 | awk '{print $1}')" ]; then
-    echo
-    echo "-----ERROR - ERROR - ERROR - ERROR - ERROR - ERROR - ERROR - ERROR - ERROR------"
-    echo "--------------------------------CHECKSUM ERROR!---------------------------------"
-    removepkg unraid-&name;-&version;
-    rm -rf &plugin; &emhttp;
-    exit 1
+  local target="&packages;/${KERNEL_V%%-*}/${LAT_PACKAGE}"
+  local tmp="${target}.tmp.$$"
+  local expected actual
+  rm -f "$tmp" "${tmp}.md5"
+  if ! wget -q -O "$tmp" "${DL_URL}/${LAT_PACKAGE}"; then
+    echo "ERROR: Unable to download SR-IOV driver $LAT_PACKAGE" &gt;&amp;2
+    rm -f "$tmp" "${tmp}.md5"
+    return 1
   fi
-  echo
-  echo "-----------Successfully downloaded SR-IOV package, please wait...!------------"
-else
-  echo
-  echo "-----ERROR - ERROR - ERROR - ERROR - ERROR - ERROR - ERROR - ERROR - ERROR-----"
-  echo "-----------------------Can't download SR-IOV package---------------------------"
-  removepkg unraid-&name;-&version;
-  rm -rf &plugin; &emhttp;
-  exit 1
-fi
+  if ! wget -q -O "${tmp}.md5" "${DL_URL}/${LAT_PACKAGE}.md5"; then
+    echo "ERROR: Unable to download checksum for $LAT_PACKAGE" &gt;&amp;2
+    rm -f "$tmp" "${tmp}.md5"
+    return 1
+  fi
+  expected="$(awk 'NR==1 {print $1}' "${tmp}.md5")"
+  actual="$(md5sum "$tmp" | awk '{print $1}')"
+  if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+    echo "ERROR: SR-IOV package checksum mismatch" &gt;&amp;2
+    rm -f "$tmp" "${tmp}.md5"
+    return 1
+  fi
+  mv -f "$tmp" "$target"
+  mv -f "${tmp}.md5" "${target}.md5"
 }
 
 check() {
-if ! ls -1 &packages;/${KERNEL_V%%-*}/ | grep -q "${PACKAGE}" ; then
-  LAT_PACKAGE="$(wget -qO- https://api.github.com/repos/airlychee/unraid-i915-sriov/releases/tags/${KERNEL_V} | jq -r '.assets[]?.name' | grep -E '^i915-sriov-.*\.txz$' | sort -V | tail -1)"
-  if [ -z "$LAT_PACKAGE" ]; then
-    echo "ERROR: No published SR-IOV package for $KERNEL_V" >&2
-    exit 1
+  local result target expected actual
+  if ! result="$(wget -qO- "https://api.github.com/repos/airlychee/unraid-i915-sriov/releases/tags/${KERNEL_V}")"; then
+    echo "ERROR: No publicly accessible SR-IOV Release for $KERNEL_V" &gt;&amp;2
+    return 1
   fi
-  echo
-  echo "------------------Downloading SR-IOV package, please wait...!-----------------"
-  echo "----------This could take some time, please don't close this window!----------"
+  LAT_PACKAGE="$(printf '%s' "$result" | jq -r '.assets[]?.name' | grep -E '^i915-sriov-.*\.txz$' | sort -V | tail -1)"
+  if [ -z "$LAT_PACKAGE" ]; then
+    echo "ERROR: No SR-IOV TXZ asset for $KERNEL_V" &gt;&amp;2
+    return 1
+  fi
+  target="&packages;/${KERNEL_V%%-*}/${LAT_PACKAGE}"
+  if [ -s "$target" ] &amp;&amp; [ -s "${target}.md5" ]; then
+    expected="$(awk 'NR==1 {print $1}' "${target}.md5")"
+    actual="$(md5sum "$target" | awk '{print $1}')"
+    if [ -n "$expected" ] &amp;&amp; [ "$expected" = "$actual" ]; then
+      echo "Verified cached package: $LAT_PACKAGE"
+      return 0
+    fi
+  fi
   download
-else
-  echo
-  echo "------------------------SR-IOV package found locally!-------------------------"
-fi
 }
 
-# Installation
 install() {
-  /sbin/installpkg "&packages;/${KERNEL_V%%-*}/${PACKAGE}*.txz"
+  /sbin/installpkg "&packages;/${KERNEL_V%%-*}/${LAT_PACKAGE}" || return 1
   depmod -a
 }
 
 enable_module() {
   modprobe i915 enable_guc=3 max_vfs=7
 }
+
+# Must verify availability before blacklisting i915 or modifying VFs.
+KERNEL_V="$(uname -r)"
+PACKAGE="i915-sriov"
+DL_URL="https://github.com/airlychee/unraid-i915-sriov/releases/download/$KERNEL_V"
+mkdir -p "&packages;/${KERNEL_V%%-*}"
+check || exit 1
 
 #Create settings file if not found
 if [ ! -f "&plugin;/&name;.cfg" ]; then
@@ -183,25 +203,12 @@ if [ "$TARGET_V" == "$(echo "$COMPARE" | sort -V | tail -1)" ]; then
 EOF
 fi
 
-#Define Variables
-KERNEL_V="$(uname -r)"
-PACKAGE="i915-sriov"
-DL_URL="https://github.com/airlychee/unraid-i915-sriov/releases/download/$KERNEL_V"
-
-if [ ! -d "&packages;/${KERNEL_V%%-*}" ]; then
-  mkdir -p "&packages;/${KERNEL_V%%-*}"
-fi
-
-#Check for old packages
-rm -rf $(ls -d &packages;/* | grep -v "${KERNEL_V%%-*}")
-
-#Execute functions
-check
-if ! ls -1 /var/log/packages/ | grep -q "^${PACKAGE}" ; then
-  echo "---------------------------Installing SR-IOV package---------------------------"
-  install
+# Install precisely the verified package for this kernel.
+if [ ! -f "/var/log/packages/${LAT_PACKAGE%.txz}" ]; then
+  echo "Installing SR-IOV driver package: $LAT_PACKAGE"
+  install || exit 1
 else
-  echo "----------------SR-IOV package already installed, nothing to do----------------"
+  echo "SR-IOV driver package already installed: $LAT_PACKAGE"
 fi
 if ! lsmod | grep -q "^i915" ; then
   echo "-------------------------Loading Kernel Module 'i915'--------------------------"
