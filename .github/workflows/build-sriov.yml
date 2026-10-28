@@ -60,6 +60,26 @@ jobs:
             https://github.com/strongtz/i915-sriov-dkms.git "$RUNNER_TEMP/i915-sriov-dkms"
           git -C "$RUNNER_TEMP/i915-sriov-dkms" rev-parse HEAD
 
+      # Raptor Lake hosts use i915, not xe. The upstream DKMS tree builds
+      # both by default; disabling xe avoids compiling unrelated Xe driver.
+      - name: Disable unused xe module for i915-only build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/i915-sriov-dkms/Makefile" <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          code = path.read_text()
+          target = "obj-m += drivers/gpu/drm/xe/\n"
+          found = code.count(target)
+          if found != 1:
+              raise SystemExit(f"Expected one xe module target, found {found}")
+          path.write_text(code.replace(target, "", 1))
+          print("Disabled xe compilation; keeping i915 and compat modules")
+          PY
+
       - name: Adapt DRM client API for Unraid 6.18.58
         shell: bash
         run: |
