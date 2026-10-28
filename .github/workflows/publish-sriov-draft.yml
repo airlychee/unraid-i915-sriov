@@ -1,0 +1,151 @@
+name: Create Draft Release - Intel i915 SR-IOV 6.18.58
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: 'Successful Build & Package workflow run ID (for example 40670810264)'
+        required: true
+        type: string
+
+# Write access applies to this publishing workflow only; the build workflow stays read-only.
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: sriov-draft-release-6.18.58-Unraid
+  cancel-in-progress: false
+
+jobs:
+  draft-release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      KERNEL_VERSION: 6.18.58-Unraid
+      DRIVER_REF: 2026.03.05.7
+      BUILD_RUN_ID: ${{ inputs.build_run_id }}
+      GH_TOKEN: ${{ github.token }}
+      PACKAGE: i915-sriov-20260305.7-6.18.58-Unraid-1.txz
+
+    steps:
+      - name: Verify source workflow run succeeded on master
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$BUILD_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo '::error::build_run_id must be numeric.'
+            exit 1
+          fi
+
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID" > "$RUNNER_TEMP/build-run.json"
+          jq -e '
+            .status == "completed" and
+            .conclusion == "success" and
+            .path == ".github/workflows/build-sriov.yml" and
+            .head_branch == "master" and
+            .event == "workflow_dispatch"
+          ' "$RUNNER_TEMP/build-run.json" >/dev/null || {
+            echo '::error::This run is not a successful, manually triggered build-sriov.yml on master.'
+            exit 1
+          }
+
+          BUILD_SHA="$(jq -r '.head_sha' "$RUNNER_TEMP/build-run.json")"
+          [[ "$BUILD_SHA" =~ ^[a-f0-9]{40}$ ]]
+          echo "BUILD_SHA=$BUILD_SHA" >> "$GITHUB_ENV"
+          echo "Verified build run $BUILD_RUN_ID from commit $BUILD_SHA"
+
+      - name: Download candidate artifact from the successful run
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release_payload
+          gh run download "$BUILD_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name 'i915-sriov-6.18.58-Unraid-TXZ-candidate' \
+            --dir release_payload
+          ls -lh release_payload
+
+      - name: Verify checksums and module payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release_payload
+          test -s "$PACKAGE"
+          test -s "$PACKAGE.md5"
+          test -s "$PACKAGE.sha256"
+          test -s build-report.txt
+          test -s package-contents.txt
+          md5sum -c "$PACKAGE.md5"
+          sha256sum -c "$PACKAGE.sha256"
+
+          grep -Fxq "Target kernel: $KERNEL_VERSION" build-report.txt
+          grep -Fxq "Driver ref: $DRIVER_REF" build-report.txt
+          grep -Fxq 'Hardware validation: NOT PERFORMED' build-report.txt
+
+          tar -tJf "$PACKAGE" > "$RUNNER_TEMP/package-manifest.txt"
+          grep -Fxq "./lib/modules/$KERNEL_VERSION/kernel/drivers/gpu/drm/i915/i915.ko.xz" \
+            "$RUNNER_TEMP/package-manifest.txt"
+          grep -Fxq "./lib/modules/$KERNEL_VERSION/updates/intel_sriov_compat.ko.xz" \
+            "$RUNNER_TEMP/package-manifest.txt"
+          test "$(grep -c '\.ko\.xz$' "$RUNNER_TEMP/package-manifest.txt")" -eq 2
+
+          mkdir -p "$RUNNER_TEMP/module-verify"
+          tar -xJf "$PACKAGE" -C "$RUNNER_TEMP/module-verify"
+          MODULE_DIR="$RUNNER_TEMP/module-verify/lib/modules/$KERNEL_VERSION"
+          xz -dc "$MODULE_DIR/kernel/drivers/gpu/drm/i915/i915.ko.xz" > "$RUNNER_TEMP/i915.ko"
+          xz -dc "$MODULE_DIR/updates/intel_sriov_compat.ko.xz" > "$RUNNER_TEMP/intel_sriov_compat.ko"
+
+          for name in i915 intel_sriov_compat; do
+            file="$RUNNER_TEMP/$name.ko"
+            test "$(modinfo -F name "$file")" = "$name"
+            modinfo -F vermagic "$file" | grep -Fq "$KERNEL_VERSION "
+          done
+          case ",$(modinfo -F depends "$RUNNER_TEMP/i915.ko")," in
+            *,intel_sriov_compat,*) ;;
+            *) echo '::error::Required intel_sriov_compat module dependency is missing.'; exit 1 ;;
+          esac
+          echo 'Package checksums, structure, module versions, and dependency passed.'
+
+      - name: Confirm this release tag is unused
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$KERNEL_VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $KERNEL_VERSION already exists; refusing to overwrite."
+            exit 1
+          fi
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$KERNEL_VERSION" >/dev/null 2>&1; then
+            echo "::error::Tag $KERNEL_VERSION already exists; refusing to overwrite."
+            exit 1
+          fi
+
+      - name: Create a DRAFT prerelease (never auto-publish)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          ## Unverified candidate — not for installation yet
+
+          - **Unraid kernel:** $KERNEL_VERSION
+          - **Driver source:** strongtz/i915-sriov-dkms, ref $DRIVER_REF
+          - **Modules packaged:** i915.ko.xz + intel_sriov_compat.ko.xz
+          - **Source workflow run:** https://github.com/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID
+          - **Build commit:** $BUILD_SHA
+
+          The compiled modules and the TXZ package passed static verification and checksum checks.
+          **No physical Unraid host/Windows VM/Plex hardware-transcoding test has been performed.**
+          This release is intentionally a **draft prerelease**. Publish only after independent testing.
+          EOF
+          gh release create "$KERNEL_VERSION" \
+            "release_payload/$PACKAGE" \
+            "release_payload/$PACKAGE.md5" \
+            "release_payload/$PACKAGE.sha256" \
+            'release_payload/build-report.txt' \
+            'release_payload/package-contents.txt' \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$BUILD_SHA" \
+            --title "Intel i915 SR-IOV $KERNEL_VERSION (UNVERIFIED)" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --draft --prerelease
+          echo 'Draft release created. It has NOT been publicly published.'
