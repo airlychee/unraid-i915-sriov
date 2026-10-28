@@ -1,4 +1,4 @@
-name: Build Intel i915 SR-IOV - Unraid 6.18.58
+name: Build & Package Intel i915 SR-IOV - Unraid 6.18.58
 
 on:
   workflow_dispatch:
@@ -139,6 +139,96 @@ jobs:
           printf 'Compiled modules: %s\n' "$count" | tee -a out/build-report.txt
           find out/modules -type f -name '*.ko' -print
           (cd out && sha256sum $(find modules -type f -name '*.ko' | sort) > SHA256SUMS)
+
+      # Produce a Slackware/Unraid installpkg-compatible tar.xz package.
+      # Do NOT install or publish it automatically; it needs hardware testing.
+      - name: Package i915 and its required compatibility module
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MODULES="out/modules"
+          I915="$MODULES/drivers/gpu/drm/i915/i915.ko"
+          COMPAT="$MODULES/compat/intel_sriov_compat.ko"
+          test -s "$I915"
+          test -s "$COMPAT"
+
+          for name_file in "i915:$I915" "intel_sriov_compat:$COMPAT"; do
+            name="${name_file%%:*}"
+            file="${name_file#*:}"
+            test "$(modinfo -F name "$file")" = "$name"
+            modinfo -F vermagic "$file" | grep -Fq "$KERNEL_VERSION "
+          done
+
+          # Prevent accidentally packaging an incomplete module set.
+          case ",$(modinfo -F depends "$I915")," in
+            *,intel_sriov_compat,*) ;;
+            *) echo "i915 does not declare expected intel_sriov_compat dependency" >&2; exit 1 ;;
+          esac
+
+          PACKAGE="i915-sriov-20260305.7-${KERNEL_VERSION}-1.txz"
+          STAGE="$RUNNER_TEMP/sriov-package"
+          DEST="out/packages"
+          mkdir -p "$STAGE/lib/modules/$KERNEL_VERSION/kernel/drivers/gpu/drm/i915" \
+                   "$STAGE/lib/modules/$KERNEL_VERSION/updates" \
+                   "$STAGE/install" "$DEST"
+
+          # Use the same layout as the original Unraid plugin and include
+          # intel_sriov_compat because modinfo lists it as an i915 dependency.
+          xz --check=crc32 -T1 -c "$I915" > \
+            "$STAGE/lib/modules/$KERNEL_VERSION/kernel/drivers/gpu/drm/i915/i915.ko.xz"
+          xz --check=crc32 -T1 -c "$COMPAT" > \
+            "$STAGE/lib/modules/$KERNEL_VERSION/updates/intel_sriov_compat.ko.xz"
+
+          cat > "$STAGE/install/slack-desc" <<EOF
+                 |-----handy-ruler------------------------------------------------------|
+          i915-sriov: Intel i915 SR-IOV driver for Unraid
+          i915-sriov:
+          i915-sriov: Target kernel: ${KERNEL_VERSION}
+          i915-sriov: Source: https://github.com/strongtz/i915-sriov-dkms
+          i915-sriov: Driver ref: ${DRIVER_REF}
+          i915-sriov: Includes i915 and intel_sriov_compat modules.
+          i915-sriov: Experimental candidate. Hardware validation required.
+          i915-sriov:
+          i915-sriov:
+          i915-sriov:
+          i915-sriov:
+          EOF
+
+          # tar.xz is the underlying archive format of a Slackware .txz.
+          # Unraid installpkg accepts this layout with install/slack-desc.
+          ( cd "$STAGE" && tar --sort=name --mtime=@0 \
+              --owner=0 --group=0 --numeric-owner -cJf \
+              "$GITHUB_WORKSPACE/$DEST/$PACKAGE" ./install ./lib )
+
+          ( cd "$DEST" && \
+              md5sum "$PACKAGE" > "$PACKAGE.md5" && \
+              sha256sum "$PACKAGE" > "$PACKAGE.sha256" && \
+              md5sum -c "$PACKAGE.md5" && \
+              sha256sum -c "$PACKAGE.sha256" )
+
+          # Check package file list and re-extract to verify payload bytes.
+          tar -tJf "$DEST/$PACKAGE" | tee "$DEST/package-contents.txt"
+          test "$(tar -tJf "$DEST/$PACKAGE" | grep -c 'i915\.ko\.xz$')" = 1
+          test "$(tar -tJf "$DEST/$PACKAGE" | grep -c 'intel_sriov_compat\.ko\.xz$')" = 1
+          mkdir -p "$RUNNER_TEMP/package-validation"
+          tar -xJf "$DEST/$PACKAGE" -C "$RUNNER_TEMP/package-validation"
+          VALID="$RUNNER_TEMP/package-validation/lib/modules/$KERNEL_VERSION"
+          xz -dc "$VALID/kernel/drivers/gpu/drm/i915/i915.ko.xz" | cmp - "$I915"
+          xz -dc "$VALID/updates/intel_sriov_compat.ko.xz" | cmp - "$COMPAT"
+
+          cp out/build-report.txt "$DEST/build-report.txt"
+          printf 'Package: %s\nContents verified: i915, intel_sriov_compat\nHardware validation: NOT PERFORMED\n' \
+            "$PACKAGE" >> "$DEST/build-report.txt"
+          ls -lh "$DEST"
+
+      - name: Upload Unraid TXZ candidate (not a published release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: i915-sriov-6.18.58-Unraid-TXZ-candidate
+          path: out/packages/
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Upload compiled modules for inspection
         uses: actions/upload-artifact@v4
