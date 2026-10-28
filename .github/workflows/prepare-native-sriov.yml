@@ -1,0 +1,271 @@
+name: Prepare Unraid 7.3 Native SR-IOV Fork Integration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out fork master
+        uses: actions/checkout@v5
+        with:
+          ref: master
+          persist-credentials: true
+
+      - name: Create 7.3 native integration and matching plugin UI package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          from xml.sax.saxutils import escape
+          from xml.etree import ElementTree as ET
+          import hashlib
+          import re
+          import subprocess
+          import tempfile
+
+          version = '2026.10.28.1'
+          plugin_path = Path('i915-sriov.plg')
+          original = plugin_path.read_text()
+          assert '<!ENTITY author    "airlychee">' in original
+          assert '<!ENTITY version   "2026.10.28">' in original
+          assert 'check || exit 1' in original
+          assert 'min="6.12.4"' in original
+          assert original.count('# Download only a publicly published, kernel-matching Release asset.') == 1
+          package = Path('packages') / f'unraid-i915-sriov-{version}.txz'
+          if package.exists():
+              raise SystemExit(f'Refusing to replace existing {package}')
+
+          script = r'''# Unraid 7.3.4+ native SR-IOV integration. Only the driver comes from the fork.
+          set -euo pipefail
+          PLUGIN_DIR="&plugin;"
+          CACHE_DIR="&packages;"
+          KERNEL_V="$(uname -r)"
+          PF="0000:00:02.0"
+          GPU_ID="8086:a7a0"
+          RELEASE="https://github.com/airlychee/unraid-i915-sriov/releases/download/${KERNEL_V}"
+          RELEASE_API="https://api.github.com/repos/airlychee/unraid-i915-sriov/releases/tags/${KERNEL_V}"
+          CACHE="${CACHE_DIR}/${KERNEL_V%%-*}"
+          mkdir -p "$CACHE"
+
+          log() { printf '[airlychee i915-sriov] %s\n' "$*"; }
+          fail() { log "ERROR: $*" >&2; exit 1; }
+
+          [[ "$KERNEL_V" == *-Unraid ]] || fail "Unsupported kernel: $KERNEL_V"
+          [[ -d "/sys/bus/pci/devices/${PF}" ]] || fail 'Expected PF 00:02.0 is missing'
+          [[ "$(cat "/sys/bus/pci/devices/${PF}/vendor")" == '0x8086' ]] || fail 'Unexpected PF vendor'
+          [[ "$(cat "/sys/bus/pci/devices/${PF}/device")" == '0xa7a0' ]] || fail 'Unexpected PF device ID'
+
+          # Select only a TXZ containing the exact Unraid kernel release.
+          PACKAGE=''
+          if api="$(wget -q -T 15 -t 2 -O - "$RELEASE_API")"; then
+            PACKAGE="$(printf '%s' "$api" | jq -r '.assets[]?.name' \
+              | grep -E '^i915-sriov-.*\.txz$' \
+              | grep -F -- "-${KERNEL_V}-" | sort -V | tail -1 || true)"
+          fi
+          if [[ -z "$PACKAGE" ]]; then
+            log 'Release API unavailable or no published matching asset; checking verified local cache'
+            while IFS= read -r item; do
+              base="${item##*/}"
+              if [[ "$base" == i915-sriov-*.txz && "$base" == *"-${KERNEL_V}-"* ]]; then
+                PACKAGE="$base"
+              fi
+            done < <(find "$CACHE" -maxdepth 1 -type f -name '*.txz' | sort -V)
+          fi
+          [[ -n "$PACKAGE" ]] || fail "No released or cached TXZ for $KERNEL_V (draft releases cannot be downloaded)"
+          TARGET="$CACHE/$PACKAGE"
+          verify() {
+            [[ -s "$TARGET" && -s "$TARGET.md5" && -s "$TARGET.sha256" ]] || return 1
+            (cd "$CACHE" && md5sum -c --status "$PACKAGE.md5" && sha256sum -c --status "$PACKAGE.sha256") || return 1
+            tar -tJf "$TARGET" | grep -Fxq "./lib/modules/$KERNEL_V/kernel/drivers/gpu/drm/i915/i915.ko.xz" || return 1
+            tar -tJf "$TARGET" | grep -Fxq "./lib/modules/$KERNEL_V/updates/intel_sriov_compat.ko.xz" || return 1
+          }
+          if verify; then
+            log "Verified cached package: $PACKAGE"
+          else
+            [[ -n "${api:-}" ]] || fail 'Cached package unavailable and Release API not reachable'
+            tmp="${TARGET}.partial.$$"
+            trap 'rm -f "${tmp}" "${tmp}.md5" "${tmp}.sha256"' EXIT
+            wget -q -T 30 -t 3 -O "$tmp" "$RELEASE/$PACKAGE" || fail 'Could not download TXZ'
+            wget -q -T 20 -t 3 -O "${tmp}.md5" "$RELEASE/$PACKAGE.md5" || fail 'Could not download MD5'
+            wget -q -T 20 -t 3 -O "${tmp}.sha256" "$RELEASE/$PACKAGE.sha256" || fail 'Could not download SHA256'
+            mv -f "$tmp" "$TARGET"
+            mv -f "${tmp}.md5" "$TARGET.md5"
+            mv -f "${tmp}.sha256" "$TARGET.sha256"
+            verify || fail 'Checksum or module layout mismatch'
+            log "Verified downloaded package: $PACKAGE"
+          fi
+
+          # Install the matched modules into Unraid's RAM-backed kernel filesystem.
+          # Never forcibly unload a running i915; a reboot is needed if stock is loaded.
+          if [[ ! -f "/var/log/packages/${PACKAGE%.txz}" ]]; then
+            /sbin/installpkg "$TARGET" || fail "Could not install $PACKAGE"
+          fi
+          depmod -a || fail 'depmod failed'
+          modinfo -F depends i915 | tr ',' '\n' | grep -Fxq intel_sriov_compat || fail 'Driver on disk is not our SR-IOV build'
+
+          # Match the original plugin's boot-time i915 loading policy.
+          mkdir -p /boot/config/modprobe.d
+          if ! grep -Eq '^[[:space:]]*blacklist[[:space:]]+i915([[:space:]]|$)' /boot/config/modprobe.d/i915.conf 2>/dev/null; then
+            printf 'blacklist i915\n' >> /boot/config/modprobe.d/i915.conf
+          fi
+          if ! lsmod | grep -q '^i915[[:space:]]'; then
+            modprobe i915 enable_guc=3 max_vfs=7 || fail 'Could not load i915 SR-IOV'
+          fi
+          RUNNING_VERSION="$(cat /sys/module/i915/version 2>/dev/null || true)"
+          if [[ "$RUNNING_VERSION" != '2026.03.05.7-sriov' ]]; then
+            log "Running driver ($RUNNING_VERSION) is not the SR-IOV build; reboot required."
+            exit 0
+          fi
+          log "Running i915 driver: $RUNNING_VERSION"
+
+          # Unraid 7.3 native System Devices owns VF count and VFIO settings.
+          # It saves them to /boot/config/sriov.cfg and sriovvfs.cfg.
+          # Avoid the old plugin's independent vfnumber= setting.
+          SRI_CFG='/boot/config/sriov.cfg'
+          if [[ -f "$SRI_CFG" ]]; then
+            sri_line="$(grep -m1 '^VFS=' "$SRI_CFG" || true)"
+            sri_line="${sri_line#VFS=}"
+            sri_line="${sri_line//\"/}"
+            for entry in $sri_line; do
+              IFS='|' read -r bdf vid count <<< "$entry"
+              if [[ "$bdf" == "$PF" && "${vid,,}" == "$GPU_ID" ]]; then
+                [[ "$count" =~ ^[0-7]$ ]] || fail "Invalid native VF count: $count"
+                current="$(cat "/sys/bus/pci/devices/$PF/sriov_numvfs")"
+                if [[ "$current" == "$count" ]]; then
+                  log "VF count already correct: $count"
+                elif [[ "$current" == '0' ]]; then
+                  [[ "$count" == '0' ]] || printf '%s\n' "$count" > "/sys/bus/pci/devices/$PF/sriov_numvfs"
+                  log "Applied native VF count: $count"
+                else
+                  log "VF count $current differs from configured $count; change with all VMs shut down (or reboot)."
+                fi
+              fi
+            done
+          fi
+
+          # Apply only native VFIO selections for VFs owned by this Intel PF.
+          VF_CFG='/boot/config/sriovvfs.cfg'
+          if [[ -f "$VF_CFG" ]]; then
+            modprobe vfio-pci || fail 'vfio-pci unavailable'
+            vf_line="$(grep -m1 '^VFSETTINGS=' "$VF_CFG" || true)"
+            vf_line="${vf_line#VFSETTINGS=}"
+            vf_line="${vf_line//\"/}"
+            for entry in $vf_line; do
+              IFS='|' read -r bdf vid class vfio mac <<< "$entry"
+              [[ "$vfio" == '1' && "${vid,,}" == "$GPU_ID" && "$class" == '0x03' ]] || continue
+              dev="/sys/bus/pci/devices/$bdf"
+              [[ -d "$dev" && -L "$dev/physfn" ]] || continue
+              [[ "$(basename "$(readlink -f "$dev/physfn")")" == "$PF" ]] || continue
+              current_driver='none'
+              if [[ -L "$dev/driver" ]]; then
+                current_driver="$(basename "$(readlink -f "$dev/driver")")"
+              fi
+              [[ "$current_driver" == 'vfio-pci' ]] && continue
+              [[ "$current_driver" == 'none' || "$current_driver" == 'i915' ]] || fail "Unexpected VF driver for $bdf: $current_driver"
+              printf 'vfio-pci\n' > "$dev/driver_override"
+              if [[ "$current_driver" == 'i915' ]]; then
+                printf '%s\n' "$bdf" > "$dev/driver/unbind"
+              fi
+              printf '%s\n' "$bdf" > /sys/bus/pci/drivers/vfio-pci/bind || fail "VFIO bind failed: $bdf"
+              log "Bound native-selected VF $bdf to vfio-pci"
+            done
+          fi
+          log 'Native Unraid System Devices manages future VF changes.'
+          '''
+
+          # Update the original plugin UI package using existing repository sources.
+          stage = Path('/tmp/airlychee-plugin-ui')
+          stage.mkdir(exist_ok=True)
+          subprocess.run(['cp','-a','source/usr/local/emhttp',str(stage)],check=True)
+          # Mapped to /usr/local/emhttp on the target host
+          target = stage / 'usr/local'
+          target.mkdir(parents=True,exist_ok=True)
+          subprocess.run(['mv',str(stage/'emhttp'),str(target/'emhttp')],check=True)
+          (stage/'install').mkdir(exist_ok=True)
+          (stage/'install/slack-desc').write_text('''intel-i915-sriov: Intel iGPU SR-IOV integration for Unraid 7.3.4+
+          intel-i915-sriov:
+          intel-i915-sriov: Unraid WebUI manages VF count and VFIO settings natively.
+          intel-i915-sriov: i915 kernel driver comes from airlychee Releases.
+          intel-i915-sriov:
+          intel-i915-sriov:
+          intel-i915-sriov:
+          intel-i915-sriov:
+          intel-i915-sriov:
+          intel-i915-sriov:
+          intel-i915-sriov:
+          ''')
+          package.parent.mkdir(exist_ok=True)
+          subprocess.run(['tar','--sort=name','--mtime=@0','--owner=0','--group=0',
+                          '--numeric-owner','-cJf',str(package.resolve()),'./install','./usr'],
+                         cwd=stage,check=True)
+          digest = hashlib.md5(package.read_bytes()).hexdigest()
+          sha = hashlib.sha256(package.read_bytes()).hexdigest()
+          package.with_name(package.name+'.md5').write_text(f'{digest}  {package.name}\n')
+          package.with_name(package.name+'.sha256').write_text(f'{sha}  {package.name}\n')
+
+          new = original.replace('<!ENTITY version   "2026.10.28">',
+                                 f'<!ENTITY version   "{version}">',1)
+          new = new.replace('min="6.12.4"','min="7.3.4"',1)
+          new = re.sub(r'(<!ENTITY md5\s+")[0-9a-f]{32}("\s*>)',
+                       lambda m: m.group(1)+digest+m.group(2),new,count=1)
+          new = new.replace('<CHANGES>', '''<CHANGES>
+          ### 2026.10.28.1
+          - Unraid 7.3.4 native WebUI controls VF count and VFIO bindings.
+          - Install only airlychee kernel-matched i915 and intel_sriov_compat modules.
+          - Reapply native persisted SR-IOV VF and VFIO settings after boot.
+          - No live force-unload of already running stock i915.
+          ''',1)
+
+          # Replace only the second Run=/bin/bash install/activation block.
+          marker = '# Download only a publicly published, kernel-matching Release asset.'
+          pos = new.index(marker)
+          inline_start = new.rfind('<INLINE>',0,pos)+len('<INLINE>')
+          inline_end = new.index('</INLINE>',pos)
+          assert inline_start > 0 and inline_start < pos < inline_end
+          new = new[:inline_start] + '\n' + escape(script) + '\n' + new[inline_end:]
+          plugin_path.write_text(new)
+
+          # Validate XML parsing, all embedded shell snippets, package checksums.
+          root = ET.parse(plugin_path).getroot()
+          assert root.attrib['version'] == version
+          assert root.attrib['author'] == 'airlychee'
+          assert root.attrib['min'] == '7.3.4'
+          for node in root.findall('FILE'):
+              if node.attrib.get('Run') == '/bin/bash':
+                  inline = node.find('INLINE')
+                  if inline is not None and inline.text:
+                      with tempfile.NamedTemporaryFile('w',suffix='.sh') as f:
+                          f.write(inline.text)
+                          f.flush()
+                          subprocess.run(['bash','-n',f.name],check=True)
+          contents = subprocess.check_output(['tar','-tJf',str(package)],text=True)
+          assert './usr/local/emhttp/plugins/intel-i915-sriov/intel-i915-sriov.page' in contents
+          assert './usr/local/emhttp/plugins/intel-i915-sriov/include/tools.sh' in contents
+          assert hashlib.md5(package.read_bytes()).hexdigest() == digest
+          print(f'Validated {version}: UI package, MD5, SHA256, XML, embedded shell syntax')
+          PY
+          git diff --check
+
+      - name: Push review branch (does not modify master)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          BRANCH="native-sriov-734-${GITHUB_RUN_ID}"
+          git switch -c "$BRANCH"
+          git add i915-sriov.plg \
+            packages/unraid-i915-sriov-2026.10.28.1.txz \
+            packages/unraid-i915-sriov-2026.10.28.1.txz.md5 \
+            packages/unraid-i915-sriov-2026.10.28.1.txz.sha256
+          git diff --cached --check
+          git commit -m 'Integrate airlychee i915 driver with native Unraid 7.3 SR-IOV UI'
+          git push -u origin "$BRANCH"
+          echo "::notice::Review at https://github.com/$GITHUB_REPOSITORY/compare/master...$BRANCH"
