@@ -60,6 +60,33 @@ jobs:
             https://github.com/strongtz/i915-sriov-dkms.git "$RUNNER_TEMP/i915-sriov-dkms"
           git -C "$RUNNER_TEMP/i915-sriov-dkms" rev-parse HEAD
 
+      - name: Adapt DRM client API for Unraid 6.18.58
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/i915-sriov-dkms/drivers/gpu/drm/i915/i915_driver.c" <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          code = path.read_text()
+          changes = {
+              "drm_client_dev_suspend(&i915->drm, false);":
+                  "drm_client_dev_suspend(&i915->drm);",
+              "drm_client_dev_suspend(dev, false);":
+                  "drm_client_dev_suspend(dev);",
+              "drm_client_dev_resume(dev, false);":
+                  "drm_client_dev_resume(dev);",
+          }
+          for before, after in changes.items():
+              found = code.count(before)
+              if found != 1:
+                  raise SystemExit(f"Expected exactly one occurrence of {before!r}, got {found}")
+              code = code.replace(before, after, 1)
+          path.write_text(code)
+          print("Applied 3 DRM client API compatibility edits to i915_driver.c")
+          PY
+
       - name: Compile modules for target kernel
         shell: bash
         run: |
