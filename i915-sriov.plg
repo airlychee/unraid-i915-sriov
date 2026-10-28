@@ -2,11 +2,11 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name      "i915-sriov">
   <!ENTITY author    "airlychee">
-  <!ENTITY version   "2026.10.28">
+  <!ENTITY version   "2026.10.28.1">
   <!ENTITY launch    "Settings/intel-&name;">
   <!ENTITY gitURL    "https://github.com/&author;/unraid-&name;/raw/master">
   <!ENTITY pluginURL "&gitURL;/&name;.plg">
-  <!ENTITY md5       "f8c97fb95dd24b466c4468164ecac611">
+  <!ENTITY md5       "73f5d24577d02fe98c43913fdef0daa2">
   <!ENTITY plugin    "/boot/config/plugins/&name;">
   <!ENTITY emhttp    "/usr/local/emhttp/plugins/intel-&name;">
   <!ENTITY packages  "/boot/config/plugins/&name;/packages">
@@ -17,11 +17,17 @@
         version="&version;"
         launch="&launch;"
         pluginURL="&pluginURL;"
-        min="6.12.4"
+        min="7.3.4"
         support="https://forums.unraid.net/topic/154464-plugin-intel-igpu-sr-iov-support-page/">
 
 
 <CHANGES>
+### 2026.10.28.1
+- Unraid 7.3.4 native WebUI controls VF count and VFIO bindings.
+- Install only airlychee kernel-matched i915 and intel_sriov_compat modules.
+- Reapply native persisted SR-IOV VF and VFIO settings after boot.
+- No live force-unload of already running stock i915.
+
 
 ### 2026.10.28
 - Fork-specific UI package and checksum.
@@ -88,203 +94,142 @@ You can get more details here: https://github.com/strongtz/i915-sriov-dkms
 
 <FILE Run="/bin/bash">
 <INLINE>
-
-# Download only a publicly published, kernel-matching Release asset.
-download() {
-  local target="&packages;/${KERNEL_V%%-*}/${LAT_PACKAGE}"
-  local tmp="${target}.tmp.$$"
-  local expected actual
-  rm -f "$tmp" "${tmp}.md5"
-  if ! wget -q -O "$tmp" "${DL_URL}/${LAT_PACKAGE}"; then
-    echo "ERROR: Unable to download SR-IOV driver $LAT_PACKAGE" &gt;&amp;2
-    rm -f "$tmp" "${tmp}.md5"
-    return 1
-  fi
-  if ! wget -q -O "${tmp}.md5" "${DL_URL}/${LAT_PACKAGE}.md5"; then
-    echo "ERROR: Unable to download checksum for $LAT_PACKAGE" &gt;&amp;2
-    rm -f "$tmp" "${tmp}.md5"
-    return 1
-  fi
-  expected="$(awk 'NR==1 {print $1}' "${tmp}.md5")"
-  actual="$(md5sum "$tmp" | awk '{print $1}')"
-  if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
-    echo "ERROR: SR-IOV package checksum mismatch" &gt;&amp;2
-    rm -f "$tmp" "${tmp}.md5"
-    return 1
-  fi
-  mv -f "$tmp" "$target"
-  mv -f "${tmp}.md5" "${target}.md5"
-}
-
-check() {
-  local result target expected actual
-  if ! result="$(wget -qO- "https://api.github.com/repos/airlychee/unraid-i915-sriov/releases/tags/${KERNEL_V}")"; then
-    echo "ERROR: No publicly accessible SR-IOV Release for $KERNEL_V" &gt;&amp;2
-    return 1
-  fi
-  LAT_PACKAGE="$(printf '%s' "$result" | jq -r '.assets[]?.name' | grep -E '^i915-sriov-.*\.txz$' | sort -V | tail -1)"
-  if [ -z "$LAT_PACKAGE" ]; then
-    echo "ERROR: No SR-IOV TXZ asset for $KERNEL_V" &gt;&amp;2
-    return 1
-  fi
-  target="&packages;/${KERNEL_V%%-*}/${LAT_PACKAGE}"
-  if [ -s "$target" ] &amp;&amp; [ -s "${target}.md5" ]; then
-    expected="$(awk 'NR==1 {print $1}' "${target}.md5")"
-    actual="$(md5sum "$target" | awk '{print $1}')"
-    if [ -n "$expected" ] &amp;&amp; [ "$expected" = "$actual" ]; then
-      echo "Verified cached package: $LAT_PACKAGE"
-      return 0
-    fi
-  fi
-  download
-}
-
-install() {
-  /sbin/installpkg "&packages;/${KERNEL_V%%-*}/${LAT_PACKAGE}" || return 1
-  depmod -a
-}
-
-enable_module() {
-  modprobe i915 enable_guc=3 max_vfs=7
-}
-
-# Must verify availability before blacklisting i915 or modifying VFs.
+# Unraid 7.3.4+ native SR-IOV integration. Only the driver comes from the fork.
+set -euo pipefail
+PLUGIN_DIR="&amp;plugin;"
+CACHE_DIR="&amp;packages;"
 KERNEL_V="$(uname -r)"
-PACKAGE="i915-sriov"
-DL_URL="https://github.com/airlychee/unraid-i915-sriov/releases/download/$KERNEL_V"
-mkdir -p "&packages;/${KERNEL_V%%-*}"
-check || exit 1
+PF="0000:00:02.0"
+GPU_ID="8086:a7a0"
+RELEASE="https://github.com/airlychee/unraid-i915-sriov/releases/download/${KERNEL_V}"
+RELEASE_API="https://api.github.com/repos/airlychee/unraid-i915-sriov/releases/tags/${KERNEL_V}"
+CACHE="${CACHE_DIR}/${KERNEL_V%%-*}"
+mkdir -p "$CACHE"
 
-#Create settings file if not found
-if [ ! -f "&plugin;/&name;.cfg" ]; then
-  FIRST_INSTALL="true"
-  echo 'vfnumber=2' > "&plugin;/&name;.cfg"
+log() { printf '[airlychee i915-sriov] %s\n' "$*"; }
+fail() { log "ERROR: $*" &gt;&amp;2; exit 1; }
+
+[[ "$KERNEL_V" == *-Unraid ]] || fail "Unsupported kernel: $KERNEL_V"
+[[ -d "/sys/bus/pci/devices/${PF}" ]] || fail 'Expected PF 00:02.0 is missing'
+[[ "$(cat "/sys/bus/pci/devices/${PF}/vendor")" == '0x8086' ]] || fail 'Unexpected PF vendor'
+[[ "$(cat "/sys/bus/pci/devices/${PF}/device")" == '0xa7a0' ]] || fail 'Unexpected PF device ID'
+
+# Select only a TXZ containing the exact Unraid kernel release.
+PACKAGE=''
+if api="$(wget -q -T 15 -t 2 -O - "$RELEASE_API")"; then
+  PACKAGE="$(printf '%s' "$api" | jq -r '.assets[]?.name' \
+    | grep -E '^i915-sriov-.*\.txz$' \
+    | grep -F -- "-${KERNEL_V}-" | sort -V | tail -1 || true)"
 fi
-
-#Check if i915 module is already blacklisted and let the plugin handle the activation from module
-if [ ! "$(grep "blacklist" /boot/config/modprobe.d/i915.conf 2>/dev/null)" ]; then
-  if [ ! -d /boot/config/modprobe.d ]; then
-    mkdir -p /boot/config/modprobe.d
-  fi
-  echo "blacklist i915" >> /boot/config/modprobe.d/i915.conf
-fi
-
-#Patch libverit.php on Unraid versions below 6.13.0
-TARGET_V="6.12.99"
-COMPARE="$(cat /etc/unraid-version | cut -d '=' -f2 | cut -d '"' -f2)
-$TARGET_V"
-if [ "$TARGET_V" == "$(echo "$COMPARE" | sort -V | tail -1)" ]; then
-  if [ ! -f /usr/local/emhttp/plugins/dynamix.vm.manager/include/libvirt.php.orig ]; then
-    cp /usr/local/emhttp/plugins/dynamix.vm.manager/include/libvirt.php /usr/local/emhttp/plugins/dynamix.vm.manager/include/libvirt.php.orig
-  else
-    cp /usr/local/emhttp/plugins/dynamix.vm.manager/include/libvirt.php.orig /usr/local/emhttp/plugins/dynamix.vm.manager/include/libvirt.php
-  fi
-  # Fix PCI address error when iGPU VF assigned to VM
-  cd / ; patch -p1 &lt;&lt;EOF
---- a/usr/local/emhttp/plugins/dynamix.vm.manager/include/libvirt.php	
-+++ b/usr/local/emhttp/plugins/dynamix.vm.manager/include/libvirt.php	
-@@ -780,7 +780,15 @@
- 					\$strSpecialAddress = '';
- 					if (\$gpu_bus == '00' &amp;&amp; \$gpu_slot == '02') {
- 						\$strXVGA = '';
--						\$strSpecialAddress = "&lt;address type='pci' domain='0x0000' bus='0x".\$gpu_bus."' slot='0x".\$gpu_slot."' function='0x".\$gpu_function."'/&gt;";
-+					    if (\$gpu_function == '00') {
-+						    \$strSpecialAddress = "&lt;address type='pci' domain='0x0000' bus='0x".\$gpu_bus."' slot='0x".\$gpu_slot."' function='0x".\$gpu_function."'/&gt;";
-+					    } else {
-+					        if (\$machine_type == 'q35'){
-+						        \$strSpecialAddress = "&lt;address type='pci' domain='0x0000' bus='0x06' slot='0x00' function='0x0'/&gt;";
-+					        } else {
-+						        \$strSpecialAddress = "&lt;address type='pci' domain='0x0000' bus='0x06' slot='0x10' function='0x0'/&gt;";
-+						    }
-+					    }
- 					}
- 
- 					\$strRomFile = '';
-EOF
-fi
-
-# Install precisely the verified package for this kernel.
-if [ ! -f "/var/log/packages/${LAT_PACKAGE%.txz}" ]; then
-  echo "Installing SR-IOV driver package: $LAT_PACKAGE"
-  install || exit 1
-else
-  echo "SR-IOV driver package already installed: $LAT_PACKAGE"
-fi
-if ! lsmod | grep -q "^i915" ; then
-  echo "-------------------------Loading Kernel Module 'i915'--------------------------"
-  enable_module
-else
-  echo "---------------------Kernel Module 'i915' already enabled----------------------"
-fi
-
-if [ -f "/sys/devices/pci0000:00/0000:00:02.0/sriov_numvfs" ]; then
-  VF_NUM="$(cat &plugin;/&name;.cfg | grep "vfnumber=" | cut -d '=' -f2 | sed "s/\"//g")"
-  CUR_VF_NUM="$(cat /sys/devices/pci0000:00/0000:00:02.0/sriov_numvfs)"
-  sleep 2
-  if [ "$VF_NUM" != "$CUR_VF_NUM" ]; then
-    echo "---Setting VFs to: ${VF_NUM}---"
-    echo ${VF_NUM} &gt; /sys/devices/pci0000:00/0000:00:02.0/sriov_numvfs
-    /usr/local/sbin/vfio-pci &gt;/dev/null 2&gt;&amp;1
-  else
-    echo "---VFs already set to: ${VF_NUM}---"
-    /usr/local/sbin/vfio-pci &gt;/dev/null 2&gt;&amp;1
-  fi
-fi
-
-
-if [ "$FIRST_INSTALL" == "true" ]; then
-  echo
-  echo "--------------------------------------------------------------------------------------------------"
-  echo "---Installation from SR-IOV plugin successful, please reboot your server to start using SR-IOV!---"
-  echo "--------------------------------------------------------------------------------------------------"
-  echo
-else
-  echo
-  echo "-------------------------------------------------"
-  echo "---Installation from SR-IOV plugin successful!---"
-  echo "-------------------------------------------------"
-  echo
-fi
-
-#Check if Plugin Update Helper is downloaded and up-to-date
-if [ ! -f &plugin;/plugin_update_helper ]; then
-  wget -q -T 5 -O &plugin;/plugin_update_helper "https://raw.githubusercontent.com/ich777/unraid-plugin_update_helper/master/plugin_update_helper"
-else
-  CUR_V="$(grep -E "Plugin-Update-Helper version:" &plugin;/plugin_update_helper | awk '{print $4}')"
-  if [ ! -s /tmp/update-helper ]; then
-    echo "$(wget -T5 -qO- https://raw.githubusercontent.com/ich777/unraid-plugin_update_helper/master/plugin_update_helper | grep -E "Plugin-Update-Helper version:" | awk '{print $4}')" > /tmp/update-helper
-    AVAIL_V="$(cat /tmp/update-helper)"
-  else
-    AVAIL_V="$(cat /tmp/update-helper)"
-  fi
-  if [ ! -z "$AVAIL_V" ]; then
-    COMPARE="$(sort -V &lt;(echo -e "${AVAIL_V}\n$CUR_V") | tail -1)"
-    if [ "$CUR_V" != "$COMPARE" ]; then
-      wget -q -T 5 -O &plugin;/plugin_update_helper "https://raw.githubusercontent.com/ich777/unraid-plugin_update_helper/master/plugin_update_helper"
+if [[ -z "$PACKAGE" ]]; then
+  log 'Release API unavailable or no published matching asset; checking verified local cache'
+  while IFS= read -r item; do
+    base="${item##*/}"
+    if [[ "$base" == i915-sriov-*.txz &amp;&amp; "$base" == *"-${KERNEL_V}-"* ]]; then
+      PACKAGE="$base"
     fi
-  fi
+  done &lt; &lt;(find "$CACHE" -maxdepth 1 -type f -name '*.txz' | sort -V)
 fi
-
-#Check if Plugin Update Helper is installed and up to date
-if [ ! -f /usr/bin/plugin_update_helper ]; then
-  cp &plugin;/plugin_update_helper /usr/bin/plugin_update_helper
-  chmod +x /usr/bin/plugin_update_helper
+[[ -n "$PACKAGE" ]] || fail "No released or cached TXZ for $KERNEL_V (draft releases cannot be downloaded)"
+TARGET="$CACHE/$PACKAGE"
+verify() {
+  [[ -s "$TARGET" &amp;&amp; -s "$TARGET.md5" &amp;&amp; -s "$TARGET.sha256" ]] || return 1
+  (cd "$CACHE" &amp;&amp; md5sum -c --status "$PACKAGE.md5" &amp;&amp; sha256sum -c --status "$PACKAGE.sha256") || return 1
+  tar -tJf "$TARGET" | grep -Fxq "./lib/modules/$KERNEL_V/kernel/drivers/gpu/drm/i915/i915.ko.xz" || return 1
+  tar -tJf "$TARGET" | grep -Fxq "./lib/modules/$KERNEL_V/updates/intel_sriov_compat.ko.xz" || return 1
+}
+if verify; then
+  log "Verified cached package: $PACKAGE"
 else
-  PLUGIN_V="$(grep -E "Plugin-Update-Helper version:" &plugin;/plugin_update_helper | awk '{print $4}')"
-  INST_V="$(grep -E "Plugin-Update-Helper version:" /usr/bin/plugin_update_helper | awk '{print $4}')"
-  COMPARE="$(sort -V &lt;(echo -e "${PLUGIN_V}\n$INST_V") | tail -1)"
-  if [ "$INST_V" != "$COMPARE" ]; then
-    kill $(ps aux | grep -E "inotifywait -q /boot/changes.txt -e move_self,delete_self" | grep -v "grep -E inotifywait" | awk '{print $2}') 2>/dev/null
-    sleep 1
-    cp &plugin;/plugin_update_helper /usr/bin/plugin_update_helper
-    chmod +x /usr/bin/plugin_update_helper
-  fi
+  [[ -n "${api:-}" ]] || fail 'Cached package unavailable and Release API not reachable'
+  tmp="${TARGET}.partial.$$"
+  trap 'rm -f "${tmp}" "${tmp}.md5" "${tmp}.sha256"' EXIT
+  wget -q -T 30 -t 3 -O "$tmp" "$RELEASE/$PACKAGE" || fail 'Could not download TXZ'
+  wget -q -T 20 -t 3 -O "${tmp}.md5" "$RELEASE/$PACKAGE.md5" || fail 'Could not download MD5'
+  wget -q -T 20 -t 3 -O "${tmp}.sha256" "$RELEASE/$PACKAGE.sha256" || fail 'Could not download SHA256'
+  mv -f "$tmp" "$TARGET"
+  mv -f "${tmp}.md5" "$TARGET.md5"
+  mv -f "${tmp}.sha256" "$TARGET.sha256"
+  verify || fail 'Checksum or module layout mismatch'
+  log "Verified downloaded package: $PACKAGE"
 fi
 
-#Start Plugin Update Helper
-if [ -z "$(ps aux | grep -E "inotifywait -q /boot/changes.txt -e move_self,delete_self" | grep -v "grep -E inotifywait" | awk '{print $2}')" ]; then
-  echo "/usr/bin/plugin_update_helper" | at now -M &gt; /dev/null 2&gt;&amp;1
+# Install the matched modules into Unraid's RAM-backed kernel filesystem.
+# Never forcibly unload a running i915; a reboot is needed if stock is loaded.
+if [[ ! -f "/var/log/packages/${PACKAGE%.txz}" ]]; then
+  /sbin/installpkg "$TARGET" || fail "Could not install $PACKAGE"
 fi
+depmod -a || fail 'depmod failed'
+modinfo -F depends i915 | tr ',' '\n' | grep -Fxq intel_sriov_compat || fail 'Driver on disk is not our SR-IOV build'
+
+# Match the original plugin's boot-time i915 loading policy.
+mkdir -p /boot/config/modprobe.d
+if ! grep -Eq '^[[:space:]]*blacklist[[:space:]]+i915([[:space:]]|$)' /boot/config/modprobe.d/i915.conf 2&gt;/dev/null; then
+  printf 'blacklist i915\n' &gt;&gt; /boot/config/modprobe.d/i915.conf
+fi
+if ! lsmod | grep -q '^i915[[:space:]]'; then
+  modprobe i915 enable_guc=3 max_vfs=7 || fail 'Could not load i915 SR-IOV'
+fi
+RUNNING_VERSION="$(cat /sys/module/i915/version 2&gt;/dev/null || true)"
+if [[ "$RUNNING_VERSION" != '2026.03.05.7-sriov' ]]; then
+  log "Running driver ($RUNNING_VERSION) is not the SR-IOV build; reboot required."
+  exit 0
+fi
+log "Running i915 driver: $RUNNING_VERSION"
+
+# Unraid 7.3 native System Devices owns VF count and VFIO settings.
+# It saves them to /boot/config/sriov.cfg and sriovvfs.cfg.
+# Avoid the old plugin's independent vfnumber= setting.
+SRI_CFG='/boot/config/sriov.cfg'
+if [[ -f "$SRI_CFG" ]]; then
+  sri_line="$(grep -m1 '^VFS=' "$SRI_CFG" || true)"
+  sri_line="${sri_line#VFS=}"
+  sri_line="${sri_line//\"/}"
+  for entry in $sri_line; do
+    IFS='|' read -r bdf vid count &lt;&lt;&lt; "$entry"
+    if [[ "$bdf" == "$PF" &amp;&amp; "${vid,,}" == "$GPU_ID" ]]; then
+      [[ "$count" =~ ^[0-7]$ ]] || fail "Invalid native VF count: $count"
+      current="$(cat "/sys/bus/pci/devices/$PF/sriov_numvfs")"
+      if [[ "$current" == "$count" ]]; then
+        log "VF count already correct: $count"
+      elif [[ "$current" == '0' ]]; then
+        [[ "$count" == '0' ]] || printf '%s\n' "$count" &gt; "/sys/bus/pci/devices/$PF/sriov_numvfs"
+        log "Applied native VF count: $count"
+      else
+        log "VF count $current differs from configured $count; change with all VMs shut down (or reboot)."
+      fi
+    fi
+  done
+fi
+
+# Apply only native VFIO selections for VFs owned by this Intel PF.
+VF_CFG='/boot/config/sriovvfs.cfg'
+if [[ -f "$VF_CFG" ]]; then
+  modprobe vfio-pci || fail 'vfio-pci unavailable'
+  vf_line="$(grep -m1 '^VFSETTINGS=' "$VF_CFG" || true)"
+  vf_line="${vf_line#VFSETTINGS=}"
+  vf_line="${vf_line//\"/}"
+  for entry in $vf_line; do
+    IFS='|' read -r bdf vid class vfio mac &lt;&lt;&lt; "$entry"
+    [[ "$vfio" == '1' &amp;&amp; "${vid,,}" == "$GPU_ID" &amp;&amp; "$class" == '0x03' ]] || continue
+    dev="/sys/bus/pci/devices/$bdf"
+    [[ -d "$dev" &amp;&amp; -L "$dev/physfn" ]] || continue
+    [[ "$(basename "$(readlink -f "$dev/physfn")")" == "$PF" ]] || continue
+    current_driver='none'
+    if [[ -L "$dev/driver" ]]; then
+      current_driver="$(basename "$(readlink -f "$dev/driver")")"
+    fi
+    [[ "$current_driver" == 'vfio-pci' ]] &amp;&amp; continue
+    [[ "$current_driver" == 'none' || "$current_driver" == 'i915' ]] || fail "Unexpected VF driver for $bdf: $current_driver"
+    printf 'vfio-pci\n' &gt; "$dev/driver_override"
+    if [[ "$current_driver" == 'i915' ]]; then
+      printf '%s\n' "$bdf" &gt; "$dev/driver/unbind"
+    fi
+    printf '%s\n' "$bdf" &gt; /sys/bus/pci/drivers/vfio-pci/bind || fail "VFIO bind failed: $bdf"
+    log "Bound native-selected VF $bdf to vfio-pci"
+  done
+fi
+log 'Native Unraid System Devices manages future VF changes.'
 
 </INLINE>
 </FILE>
