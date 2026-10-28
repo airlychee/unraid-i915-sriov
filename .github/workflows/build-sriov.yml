@@ -16,7 +16,7 @@ jobs:
 
     steps:
       - name: Check out plugin repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           persist-credentials: false
 
@@ -223,7 +223,7 @@ jobs:
           ls -lh "$DEST"
 
       - name: Upload Unraid TXZ candidate (not a published release)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: i915-sriov-6.18.58-Unraid-TXZ-candidate
           path: out/packages/
@@ -231,7 +231,7 @@ jobs:
           retention-days: 14
 
       - name: Upload compiled modules for inspection
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: i915-sriov-6.18.58-Unraid-unverified
           path: out/
