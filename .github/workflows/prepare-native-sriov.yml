@@ -44,8 +44,8 @@ jobs:
 
           script = r'''# Unraid 7.3.4+ native SR-IOV integration. Only the driver comes from the fork.
           set -euo pipefail
-          PLUGIN_DIR="&plugin;"
-          CACHE_DIR="&packages;"
+          PLUGIN_DIR="/boot/config/plugins/i915-sriov"
+          CACHE_DIR="/boot/config/plugins/i915-sriov/packages"
           KERNEL_V="$(uname -r)"
           PF="0000:00:02.0"
           GPU_ID="8086:a7a0"
@@ -119,7 +119,7 @@ jobs:
             modprobe i915 enable_guc=3 max_vfs=7 || fail 'Could not load i915 SR-IOV'
           fi
           RUNNING_VERSION="$(cat /sys/module/i915/version 2>/dev/null || true)"
-          if [[ "$RUNNING_VERSION" != '2026.03.05.7-sriov' ]]; then
+          if [[ "$RUNNING_VERSION" != *-sriov ]]; then
             log "Running driver ($RUNNING_VERSION) is not the SR-IOV build; reboot required."
             exit 0
           fi
